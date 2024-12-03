@@ -6,7 +6,7 @@ import sys, os, argparse, datetime, gzip
 #
 DATE = datetime.datetime.now().strftime("%Y%m%d")
 PROG = sys.argv[0].split('/')[-1]
-DESC = 'Process an input FASTA to rename the sequences and sort the output.'
+DESC = 'Process an input FASTA along with annotations to rename the sequences and sort the output.'
 MIN_CHR_LEN = 1_000_000 # Minimum length to label a sequence as a chromosome
 MIN_SEQ_LEN = 1_000     # Minimum length to export a sequence
 
@@ -18,12 +18,14 @@ def parse_args():
     p.add_argument('-f', '--in-fasta', required=True, help='(str) Path to input FASTA.')
     p.add_argument('-i', '--in-fai', required=True, help='(str) Path to input FASTA index (FAI).')
     p.add_argument('-k', '--name-key', required=False, default=None, help='(str) Path to name key file.')
-    p.add_argument('-o', '--out-dir',  required=False, default='.',  help='(str) Output directory.')
+    p.add_argument('-o', '--out-dir',  required=False, default='.', help='(str) Output directory.')
     p.add_argument('-b', '--basename', required=False, default=DATE, help='(str) Name of current run. Defaults to datetime.')
-    p.add_argument('-m', '--min-chr-len', default=MIN_CHR_LEN, type=float, help=f'(int/float) Minimum length of sequence to label as a chromosome.  [default = {MIN_CHR_LEN:,}]')
+    p.add_argument('-m', '--min-chr-len', required=False, default=MIN_CHR_LEN, type=float, help=f'(int/float) Minimum length of sequence to label as a chromosome.  [default = {MIN_CHR_LEN:,}]')
+    p.add_argument('-g', '--gtf', required=False, default=None, help='(str) Path to input GTF/GFF3.')
+    p.add_argument('-l', '--min-seq-len', required=False, default=MIN_SEQ_LEN, type=float, help=f'(int/float) minimum length needed to export a sequence.  [default = {MIN_SEQ_LEN:,}]')
     p.add_argument('--rename-by-length', action='store_true', help='Rename the chromosome sequences by their length in BP (i.e., longest sequences is chromosome 1).')
     p.add_argument('--export-sorted', action='store_true', help='Export the sequences sorted by size. Defaults to the order of sequences in the FAI.')
-    p.add_argument('-l', '--min-seq-len', required=False, default=MIN_SEQ_LEN, type=float, help=f'(int/float) minimum length needed to export a sequence.  [default = {MIN_SEQ_LEN:,}]')
+
     # Check input arguments
     args = p.parse_args()
     args.out_dir = args.out_dir.rstrip('/')
@@ -32,6 +34,8 @@ def parse_args():
     assert os.path.exists(args.in_fai)
     if args.name_key is not None:
         assert os.path.exists(args.name_key)
+    if args.gtf is not None:
+        assert os.path.exists(args.gtf)
     assert args.min_chr_len > 0
     assert args.min_seq_len > 0
     # If renaming by length, output must be sorted
@@ -115,6 +119,8 @@ def filter_fasta(genome_dict, fai_dict, basename, name_key=None, min_chr_len=MIN
     fa_out = open(f'{basename}.fasta', 'w')
     tsv_out = open(f'{basename}.info.tsv', 'w')
     tsv_out.write('#SeqIdx\tSeqNewName\tSeqOldName\tSeqLenBP\n')
+    # Return a dictionary of old name/new name pairs
+    name_pairs = dict()
     # For logs
     total_len = 0
     n_seqs = 0
@@ -169,13 +175,55 @@ def filter_fasta(genome_dict, fai_dict, basename, name_key=None, min_chr_len=MIN
         for start in range(0, seq_len, fa_line_width):
             seq_line = sequence[start:(start+fa_line_width)]
             fa_out.write(f'{seq_line}\n')
+        # Save the name pairs
+        name_pairs[old_name] = new_name
     # Report to logs
-    print(f'    Exported {n_seqs:,} sequences (including {n_chrs:,} chromosomes), with a total length of {total_len:,} bp.')
+    print(f'    Exported {n_seqs:,} sequences (including {n_chrs:,} chromosomes), with a total length of {total_len:,} bp.\n')
     # Close outputs
     fa_out.close()
     tsv_out.close()
+    return name_pairs
 
-
+def process_gtf(gtf_f, basename, name_pairs):
+    '''Process the GTF/GFF to rename chromosome IDs'''
+    print('Processing GTF/GFF...')
+    # Determine if input is a GTF or a GFF
+    suffix = None
+    f = gtf_f.rstrip('.gz')
+    if f.endswith('gff'):
+        suffix = 'gff'
+    elif f.endswith('gff3'):
+        suffix = 'gff3'
+    elif f.endswith('gtf'):
+        suffix = 'gtf'
+    else:
+        sys.exit(f"Error: input file `{gtf_f}` is of unknown type (non GTF/GFF/GFF3).")
+    print(f'    Input file is of type: {suffix}.')
+    records = 0
+    # Determine the new output based on the suffix
+    f_out = open(f'{basename}.{suffix}', 'w')
+    f_out.write(f'## {DATE}\n## {PROG}\n')
+    # Parse the input file and change the chromosome names based on the name pairs key
+    with gzip.open(gtf_f, 'rt') if gtf_f.endswith('.gz') else open(gtf_f) as f:
+        for i, line in enumerate(f):
+            line = line.strip('\n')
+            # Skip comments and empty lines
+            if len(line) == 0:
+                continue
+            if line.startswith('#'):
+                continue
+            records += 1
+            fields = line.split('\t')
+            old_chr_name = fields[0]
+            # Make sure that the previous name is in the key
+            new_chr_name = name_pairs.get(old_chr_name, 'None')
+            if new_chr_name is None:
+                sys.exit(f"Error: Sequence ID in line {i} not in name pairs key. Make sure IDs in the FASTA and GTF/GFF match.")
+            fields[0] = new_chr_name
+            row = '\t'.join(fields)
+            f_out.write(f'{row}\n')
+    print(f'    Rename sequence IDs for {records:,} GTF/GFF records.')
+    f_out.close()
 
 def now():
     '''Print the current date and time.'''
@@ -193,7 +241,10 @@ def main():
     # Load the FASTA
     genome = read_fasta(args.in_fasta)
     # Process the sequences
-    filter_fasta(genome, fai, basename, name_key, args.min_chr_len, args.min_seq_len, args.rename_by_length, args.export_sorted)
+    name_pairs = filter_fasta(genome, fai, basename, name_key, args.min_chr_len, args.min_seq_len, args.rename_by_length, args.export_sorted)
+    # Process the GTF/GFF3 if needed
+    if args.gtf is not None:
+        process_gtf(args.gtf, basename, name_pairs)
 
 
     print(f'\n{PROG} finished on {now()}')
